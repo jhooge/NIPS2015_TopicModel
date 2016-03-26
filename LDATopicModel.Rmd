@@ -1,4 +1,4 @@
----
+ ---
 title: "Latent Dirichlet Allocation Topic Modeling (lda) on NIPS 2015 Papers"
 author: "Jens Hooge"
 date: "16. Februar 2016"
@@ -27,8 +27,7 @@ library(caret) # ml model wrapper lib, but only used for data transformation her
 
 library(rbokeh) # pretty (interactive) plotting
 
-
-load("ldaModels_NIPS2015.rda")
+load("ldaModels_NIPS2015_k2to25_alpha001to12.rda")
 load("vocab.rda")
 load("termTable.rda")
 load("documents.rda")
@@ -78,7 +77,7 @@ shutDownCluster <- function(cluster) {
 
 # Read the NIPS 2015 Corpus
 
-First we will read all the nips papers in a data frame. We will use the abstracts for the training of our LDA
+First we will read all the nips papers in a data frame. We will use the abstracts for the training of our LDA.
 ```{r}
 papers = fread("~/Datasets/kaggle/NIPS2015_papers/Papers.csv")
 docs = papers$Abstract
@@ -149,19 +148,27 @@ TODO: Explain the different Parameters (see notes and http://videolectures.net/m
 TODO: Tune the hyperparameters too, using expand.grid
 TODO: Fix harmonic mean normalization method. Harmonic mean always decreases with increasing number of topics. This cant be right.
 
-```{r}
-K       <- 20
-G       <- 5000
-alpha   <- 0.02
-eta     <- 0.02
-ntopics <- seq(2, 20, by=1) 
+For the symmetric dirichlet distribution, a high alpha-value means that each document is likely to contain a mixture of most of the topics, and not any single topic specifically. A low alpha value puts less such constraints on documents and means that it is more likely that a document may contain mixture of just a few, or even only one, of the topics. Likewise, a high beta-value means that each topic is likely to contain a mixture of most of the words, and not any word specifically, while a low value means that a topic may contain a mixture of just a few of the words.
 
-## Better something like this. 
-## These are about 225 models, which runs about 4 minutes respectively on 4 cores, which will result in about 15 hrs compute time.
-# params <- expand.grid(K=20, G=5000,
-#                       alpha=seq(0.01, 0.1, length.out = 5),
-#                       eta=seq(0.01, 0.1, length.out = 5),
-#                       ntopics=seq(2, 10, by=1))
+If, on the other hand, the distribution is asymmetric, a high alpha-value means that a specific topic distribution (depending on the base measure) is more likely for each document. Similarly, high beta-values means each topic is more likely to contain a specific word mix defined by the base measure.
+
+In practice, a high alpha-value will lead to documents being more similar in terms of what topics they contain. A high beta-value will similarly lead to topics being more similar in terms of what words they contain. (source: http://stats.stackexchange.com/questions/37405/natural-interpretation-for-lda-hyperparameters)
+
+```{r}
+G <- 100 ## number of iterations
+## alpha and eta are hyperparameters contring the sparsity of the document/topic matrix (theta)
+## and the word/topic (lambda) sparsity
+# alpha   ## Papers are very specific such that a low alpha is more probable.
+# eta     ## The scalar value of the Dirichlet hyperparamater for topic multinomials.
+k = seq(2, 25, by=1) ## The number of topics a document contains.
+
+## We will define parameter sets for 2400 LDA models, 
+## which can be trained in about 1 hour using 8 cpu threads‚
+params <- expand.grid(G=G,
+                      k=k,
+                      alpha=seq(0.01, 12, length.out=10),
+                      eta=seq(0.01, 12, length.out=10))
+params <- setNames(split(params, seq(nrow(params))), rownames(params))
 ```
 
 # Model Tuning
@@ -172,9 +179,23 @@ TODO: Proper explaination on http://www.win-vector.com/blog/2016/01/parallel-com
 ```{r, eval=FALSE}
 set.seed(357)
 
+# worker <- function() {
+#   bindToEnv(objNames=c("documents", "vocab", "G", "alpha", "eta"))
+#   function(k) {
+#     lda::lda.collapsed.gibbs.sampler(documents = documents, K = k, vocab = vocab, 
+#                                      num.iterations = G, alpha = alpha, 
+#                                      eta = eta, initial = NULL, burnin = 0,
+#                                      compute.log.likelihood = TRUE)
+#   }
+# }
+
 worker <- function() {
-  bindToEnv(objNames=c("documents", "vocab", "G", "alpha", "eta"))
-  function(k) {
+  bindToEnv(objNames=c("documents", "vocab"))
+  function(params) {
+    k <- params$k
+    G <- params$G
+    alpha <- params$alpha
+    eta <- params$eta
     lda::lda.collapsed.gibbs.sampler(documents = documents, K = k, vocab = vocab, 
                                      num.iterations = G, alpha = alpha, 
                                      eta = eta, initial = NULL, burnin = 0,
@@ -184,7 +205,8 @@ worker <- function() {
 
 t1 <- Sys.time()
 cluster <- startCluster()
-models <- parLapply(cluster, ntopics, worker())
+# models <- parLapply(cluster, ntopics, worker())
+models <- parLapply(cluster, params, worker())
 shutDownCluster(cluster)
 t2 <- Sys.time()
 t2 - t1
@@ -196,17 +218,105 @@ save(models, file="ldaModels_NIPS2015.rda")
 ```{r, eval=FALSE}
 t1 <- Sys.time()
 models = lapply(ntopics, lda::lda.collapsed.gibbs.sampler(documents = documents, K = k, vocab = vocab, 
-                                                          num.iterations = G, alpha = alpha,
-                                                          eta = eta, initial = NULL, burnin = 0,
+                                                          num.iterations = params$G, alpha = params$alpha,
+                                                          eta = params$eta, initial = NULL, burnin = 0,
                                                           compute.log.likelihood = TRUE))
 t2 <- Sys.time()
 t2 - t1
+```
+
+# Convergence
+To first let's have a look whether our models have converged after `r G` iterations. The following figure shows
+the log-likelihood in each iteration of each model assuming a number of topics. The mean log likelihood over all models is depicted in red
+
+```{r, echo=FALSE}
+logLiks = lapply(models, function(L)  L$log.likelihoods[1,])
+logLiks.df <- as.data.frame(logLiks)
+meanLogLiks <- data.frame(Iteration=1:nrow(logLiks.df), 
+                          logLikelihood=rowMeans(logLiks.df))
+logLiks.df$Iteration <- rownames(logLiks.df)
+colnames(logLiks.df) <- 1:ncol(logLiks.df)
+
+molten_logLiks <- melt(logLiks.df)
+colnames(molten_logLiks) <- c("Iteration", "NumberOfTopics", "logLikelihood")
+molten_logLiks$Iteration <- as.numeric(molten_logLiks$Iteration)
+
+ggplot(data=molten_logLiks) + 
+  geom_line(aes(x=Iteration, y=logLikelihood, color=NumberOfTopics), alpha=0.2, show.legend = FALSE) +
+  geom_line(data = meanLogLiks, aes(x=Iteration, y=logLikelihood), color="black", linetype="dashed") +
+  theme_bw()
 ```
 
 # Model Selection
 We will select our model based on harmonic mean maximization.
 TODO: Check http://epub.wu.ac.at/3558/1/main.pdf for proper explanation and comparison to other performance values.
 TODO: Fix harmonic mean calculation.
+```{r, echo=FALSE, eval=FALSE}
+params <- expand.grid(G=G,
+                      k=k,
+                      alpha=seq(0.01, 12, length.out=10),
+                      eta=seq(0.01, 12, length.out=10))
+
+## TODO: Check whether the matrix is filled in the right order
+## returns a grid of harmonic mean log likelihoods
+## for a fixed number of topics k and a fixed number of iterations
+## gradient lines are plotted against the LDA hyperparameters alpha and eta
+paramMatrix <- function(k, params, models) {
+  topic.params <- params[which(params$k==k),]
+  indexes <- as.numeric(rownames(topic.params))
+  alpha <- unique(topic.params$alpha)
+  eta <- unique(topic.params$eta)
+  selectedModels <- models[indexes]
+  logLiks = lapply(selectedModels, function(m)  m$log.likelihoods[1, ])
+  harmMeanLogLiks <- sapply(logLiks, function(h) harmonicMean(h))
+  m <- matrix(harmMeanLogLiks, nrow=length(alpha), ncol=length(eta))
+  rownames(m) <- alpha
+  colnames(m) <- eta
+  return(m)
+}
+
+## Test whether matrix has been filled correctly and axis labels are correct
+# topic.params <- params[which(params$k==3),]
+# print(topic.params)
+# indexes <- as.numeric(rownames(topic.params))
+# alpha <- unique(topic.params$alpha)
+# eta <- unique(topic.params$eta)
+# selectedModels <- models[indexes]
+# logLiks = lapply(selectedModels, function(m)  m$log.likelihoods[1, ])
+# harmMeanLogLiks <- sapply(logLiks, function(h) harmonicMean(h))
+#
+# m <- melt(m_3)
+# colnames(m) <- c("alpha", "eta", "HarmonicMeanlogLikelihood" )
+# 
+# ggplot(data=m, aes(x=alpha, y=eta, z=HarmonicMeanlogLikelihood)) +
+#   stat_contour(bins=20, aes(colour = ..level..)) + 
+#   theme_bw()
+#
+# harmonicMean(models[[137]]$log.likelihoods[1, ]) ## alpha=55.56, eta=11.12 --> -218668.9
+# harmonicMean(models[[47]]$log.likelihoods[1, ])  ## alpha=55.56, eta=0.01 --> should be smaller than -218668.9
+# harmonicMean(models[[173]]$log.likelihoods[1, ])  ## alpha=100.00, eta=11.12 --> should be close to -218668.9
+
+## contour matrices for each k over alpha and eta hyper-parameters
+contourMatrices <- lapply(unique(params$k), paramMatrix, params, models)
+## vector of argmax(likelihood) indices over all alphas of each contour matrix
+opt_alphas <- sapply(contourMatrices, function(m) which(rowSums(m)==max(rowSums(m))))
+## vector of argmax(likelihood) indices over all etas of each contour matrix
+opt_etas   <- sapply(contourMatrices, function(m) which(colSums(m)==max(colSums(m))))
+logLiks    <- sapply(contourMatrices, function(m) max(apply(m, 1, max)))
+## Combine everything in a data frame including the optimal parameters over all LDAs with 
+## a fixed k and number of iterations G
+opt_params <- data.frame(k=unique(params$k), 
+                         alpha=names(opt_alphas), 
+                         eta=names(opt_etas),
+                         logLikelihood=logLiks)
+
+knitr::kable(opt_params, caption = "Optimal LDA hyper-parameter settings over all k and a fixed number of iterations G")
+
+ggplot(data=opt_params, aes(x=k, y=logLikelihood)) +
+  geom_line() +
+  theme_bw()
+```
+
 ```{r}
 harmonicMean = function(logLikelihoods, precision=2000L) {
   llMed = median(logLikelihoods)
@@ -214,49 +324,236 @@ harmonicMean = function(logLikelihoods, precision=2000L) {
                                        prec = precision) + llMed))))
 }
 
-logLiks = lapply(models, function(L)  L$log.likelihoods)
-harmMeans = sapply(logLiks, function(h) harmonicMean(h))
-k = which(harmMeans==max(harmMeans))
+argmax <- function(x) {
+  which(x==max(x))
+}
 
-plot(ntopics, harmMeans, type = "l")
+argmin <- function(x) {
+  which(x==min(x))
+}
 
-k=8 # As long as harmMean maximization does not work use 8-topic model, as it seems to be reasonable based t-SNE projection
-model = models[[k]]
+## Compute argmax over 
+mat_argmax <- function(X) {
+  row_argmax <- argmax(apply(X, 1, max))
+  col_argmax <- argmax(apply(X, 2, max))
+  result <- c(row_argmax, col_argmax)
+  return(result)
+}
+
+## Compute maximum likelihood for model likelihood matrix with k topics
+mat_max <- function(X) {
+  result <- X[mat_argmax(X)[1], mat_argmax(X)[2]]
+  return(result)
+}
+
+getTopic <- function(topic.vec) {
+  argmax <- which(topic.vec==max(topic.vec))
+  if(length(argmax)>1){
+    argmax <- argmax[1]
+  }
+  return(argmax)
+}
+
+getTopicProportion <- function(topic.vec) {
+  return(topic.vec[getTopic(topic.vec)])
+}
+
+getModelByParams <- function(k, alpha, eta, params, models) {
+  k_ <- as.character(k)
+  alpha_ <- as.character(alpha)
+  eta_ <- as.character(eta)
+  params$k <- as.character(params$k)
+  params$alpha <- as.character(params$alpha)
+  params$eta <- as.character(params$eta)
+  
+  param_subset <- subset(params, k==k_ & alpha==alpha_ & eta==eta_)
+  i <- rownames(param_subset)
+  return(models[[i]])
+}
+
+
+## Computes the harmonic mean of log Likelihoods over all iterations
+## in an LDA model for a fixed number of topics k and returns the 
+## length(params[, 1]) x length(params[, 2]) matrix
+## TODO: Store the log L values in a 3 dim array, 
+## LMatrix <- array(0=c(length(unique(params$k)),
+##                      length(unique(params$alpha)),
+##                      length(unique(params$eta))))
+LMatrix <- function(k, params, models) {
+  topic.params <- params[which(params$k==k),]
+  indexes <- as.numeric(rownames(topic.params))
+  alpha <- unique(topic.params$alpha)
+  eta <- unique(topic.params$eta)
+  selectedModels <- models[indexes]
+  logLiks = lapply(selectedModels, function(m)  m$log.likelihoods[1, ])
+  harmMeanLogLiks <- sapply(logLiks, function(h) harmonicMean(h))
+  m <- matrix(harmMeanLogLiks, nrow=length(alpha), ncol=length(eta))
+  return(m)
+}
+
+params <- expand.grid(G=100,
+                      k=seq(2, 25, by=1),
+                      alpha=seq(0.01, 12, length.out=10),
+                      eta=seq(0.01, 12, length.out=10))
+                      
+alphas <- as.numeric(unique(params$alpha))
+etas <- as.numeric(unique(params$eta))
+
+## Maximum Likelihood Estimation of k, alpha and eta
+LMats <- lapply(unique(params$k), LMatrix, params, models)
+max_LMats <- sapply(LMats, mat_max)
+argmax_LMats <- lapply(LMats, mat_argmax)
+
+opt_L <- max(max_LMats)
+opt_k <- unique(params$k)[argmax(max_LMats)]
+opt_alpha <- unique(params$alpha)[argmax_LMats[[argmax(max_LMats)]][1]]
+opt_eta <- unique(params$eta)[argmax_LMats[[argmax(max_LMats)]][2]]
+
+sprintf("Best model with log likelihood L=%.2f is parameterized with (k=%i, alpha=%.2f, eta=%.2f)", 
+        opt_L, opt_k, opt_alpha, opt_eta)
 ```
+
+Now, k=2 seems a little unrealistic, given that we are looking at 400 abstracts. Let's look at the contour of the log Likelihoods for this k.
+
+```{r}
+plotFilledContour <- function(x, y, z, nlevels=30, ...) {
+  lvls <- seq(min(z), max(z), length.out = nlevels)
+  cols <- colorRampPalette(c("blue", "red")) (nlevels - 1)
+  fig <- filled.contour(x, y, z, plot.axes={axis(1); axis(2)},
+                        col=cols, levels=lvls, ...)
+  return(fig)
+}
+
+## contour matrices for each k over alpha and eta hyperparameters
+fig <- plotFilledContour(alphas, etas, LMats[[1]], 
+                         xlab = "alpha",
+                         ylab = "eta")
+```
+
+Looking at the contour, the log likelihood seem to increase sharply with eta and then decrease slowly, showing a clear maximum, while the log likelihood over alpha seems to be increasing sharply at first, but then stay more or less constant with increasing alpha. This behavior is more or less the same with increasing k, apart from the fact that the maximum log likelihood decreases with k, which can be seen in the figure below.
+
+```{r}
+opt_alphas <- sapply(LMats, function(m) which(rowSums(m)==max(rowSums(m))))
+## vector of argmax(likelihood) indices over all etas of each contour matrix
+opt_etas   <- sapply(LMats, function(m) which(colSums(m)==max(colSums(m))))
+logLiks    <- sapply(LMats, function(m) max(apply(m, 1, max)))
+## Combine everything in a data frame including the optimal parameters over all LDAs with 
+## a fixed k and number of iterations G
+opt_params <- data.frame(k=unique(params$k), 
+                         alpha=alphas, 
+                         eta=etas,
+                         logLikelihood=logLiks)
+                         
+ggplot(data=opt_params, aes(x=k, y=logLikelihood)) +
+  geom_line() +
+  xlab("k") +
+  ylab("Harmonic Mean log Likelihood") +
+  theme_bw()
+```
+
+Lets have a closer look at sections of this contour at the selected optimal values for alpha an eta.
+
+```{r}
+## Plot eta section through hypecube at k=2 and alpha=12
+eta_section <- data.frame(eta=etas, logLikelihood=LMats[[opt_k]][2, ])
+ggplot(data=eta_section, aes(x=eta, y=logLikelihood, color=logLikelihood)) +
+  geom_line() +
+  theme_bw()
+```
+
+The log-likelihood function for a fixed k and alpha has a clear maximum, which is more or less the same for all alphas, when we look at the alpha/eta contour above.
+
+```{r}
+## Plot alpha section through hypercube at k=2 and eta=1.32222
+alpha_section <- data.frame(alpha=alphas, logLikelihood=LMats[[opt_k]][, 1])
+ggplot(data=alpha_section, aes(x=alpha, y=logLikelihood, color=logLikelihood)) +
+  geom_line() +
+  theme_bw()
+```
+
+The log-likelihood function for a fixed
+
+Reasonable MLE for parameter estimation, does not seem to be possible:
+
+- Likelihood for alpha is monotonically increasing for optimal eta for all k
+- Likelihood for optimal eta is more or less constant for all eta and k
+- Likelihood for k is monotonically decreasing for optimal alpha and eta.
+
+Model selection is mainly driven by the choice of k. With this optimization
+approach k will always be small and alpha large. So the LDA will try to classify
+each document with the smallest number of clusters, while alpha is selected as large
+as possible. A large alpha, however means that the LDA tries to explain each topic with
+the maximum number of topics available. This leads to porblems in t-SNE clustering.
+
+Let's fix eta to opt_eta and keep alpha relatively small and plot their 2d embeddings
+via PCA, MDS and t-SNE projections.
+We will minimize the error of the t-SNE projectons over all perplexity
+values between 5-70 and project the documents based on the minimal error.
+after 100 iterations.
+
+
+The further analysis will only consider the model with the maximum log-likelihood depicted in the table above.
+
+```{r}
+## This will select a model with 2 topics. This doesn't make sense, given some exploration beforehand
+## Especially with regard to the t-SNE dimensionality reduction which identifies about 8-9 clusters in the corpus.
+params <- as.data.frame(apply(params, 2, as.character))
+
+i <- which(opt_params$logLikelihood==max(opt_params$logLikelihood))
+opt_k <- as.character(opt_params[i, ]$k)
+opt_alpha <- as.character(opt_params[i, ]$alpha)
+opt_eta <- as.character(opt_params[i, ]$eta)
+opt_model_index <- as.numeric(rownames(subset(params, (k==opt_k & 
+                                                       alpha==opt_alpha & 
+                                                       eta==opt_eta))))
+opt_k <- as.numeric(opt_k)
+opt_alpha <- as.numeric(opt_alpha)
+opt_eta <- as.numeric(opt_eta)
+model <- models[[opt_model_index]]
+```
+
+
+
+```{r, echo=FALSE}
+m <- melt(contourMatrices[[i]])
+colnames(m) <- c("alpha", "eta", "HarmonicMeanlogLikelihood" )
+
+ggplot(data=m, aes(x=alpha, y=eta, z=HarmonicMeanlogLikelihood)) +
+  geom_vline(xintercept = opt_alpha, colour="red", linetype = "longdash", alpha=0.5) +
+  geom_hline(yintercept = opt_eta, colour="red", linetype = "longdash", alpha=0.5) +
+  stat_contour(bins=20, aes(colour = ..level..)) +
+  theme_bw()
+```
+
+The optimal model is described by the following parameters: alpha=`r opt_alpha` and eta=`r opt_eta`.
 
 # Get the top 5 words defining the first 5 topics
 ```{r}
 N <- 5 
 top.words <- top.topic.words(model$topics, 5, by.score=TRUE)
 top.words.df <- as.data.frame(top.words)
-colnames(top.words.df) <- ntopics[1]:ntopics[k]
+colnames(top.words.df) <- 1:opt_k
 
-knitr::kable(top.words.df[,1:5], caption = "Top 5 terms per topic")
+knitr::kable(top.words.df[ ,1:opt_k], caption = "Top 5 terms per topic")
 ```
 
 # Get the top 5 documents assigned to the first 5 topics
-```{r}
+```{r, eval=FALSE, echo=FALSE} 
 top.documents <- top.topic.documents(model$document_sums, 
                                      num.documents = 20, 
-                                     alpha = alpha)
+                                     alpha = opt_alpha)
 top.documents.df <- as.data.frame(top.documents)
-colnames(top.documents.df) <- ntopics[1]:k
+colnames(top.documents.df) <- 1:opt_k
 
 top.documents.df.part <- head(top.documents.df, 10)
-
-topic_titles <- data.frame(Topic1=papers[as.numeric(top.documents.df.part[ ,1]),]$Title,
-                           Topic2=papers[as.numeric(top.documents.df.part[ ,2]),]$Title,
-                           Topic3=papers[as.numeric(top.documents.df.part[ ,3]),]$Title,
-                           Topic4=papers[as.numeric(top.documents.df.part[ ,4]),]$Title,
-                           Topic5=papers[as.numeric(top.documents.df.part[ ,5]),]$Title)
+topic_titles <- data.frame(lapply(1:opt_k, function(k) papers[as.numeric(top.documents.df.part[ ,k]),]$Title))
+colnames(topic_titles) <- 1:opt_k
 
 knitr::kable(topic_titles, caption = "Top 10 titles per topic")
 ```
 
-# Get topics with maximum log likelihood for docs
-First we will compute to which proportion a document belongs to a topic. As zero values and NAs will be a problem in the succeeding steps we will add a small number to each element in the topic proportion matrix. The topic with the maximum proportion value will then be assigned to the document.
-TODO: Compare this assignment with the top.documents matrix. The result should be the same, and I don't belive it is.
-TODO: Plot an example proportion vector for a few documents.
+# Get maximum proportion topic for each document
+First we will compute to which proportion a document belongs to a topic. As zero values and NAs will be a problem in the succeeding steps we will add a small number to each element in the topic proportion matrix. The topic with the maximum proportion value will then be assigned to the document. Proportion is a measure indicating the number of times words in each document were assigned to each topic. 
 ```{r}
 topic.proportions <- t(model$document_sums) / colSums(model$document_sums)
 topic.proportions <- topic.proportions + 0.000000001 ## Laplace smoothing
@@ -269,14 +566,33 @@ getTopic <- function(topic.vec) {
   return(argmax)
 }
 
-getMaxLogLik <- function(topic.vec) {
+getTopicProportion <- function(topic.vec) {
   return(topic.vec[getTopic(topic.vec)])
 }
 
 # assign each document the topic with maximum probability
 doc.topic <- unlist(apply(topic.proportions, 1, getTopic))
-doc.topic.words <- apply(top.words[,doc.topic], 2, paste, collapse=".")
-doc.logLik <- unlist(apply(topic.proportions, 1, getMaxLogLik))
+doc.maxTopicProportion <- unlist(apply(topic.proportions, 1, getTopicProportion))
+doc.topic.words <- apply(top.words[, doc.topic], 2, paste, collapse=".")
+```
+
+Each document can be seen as a mixture of topics as exemplified in the figure below.
+```{r, echo=FALSE}
+N <- 4
+tp <- topic.proportions[sample(1:dim(topic.proportions)[1], N),]
+colnames(tp) <- apply(top.words, 2, paste, collapse=" ")
+tp.df <- melt(cbind(data.frame(tp),
+                    document=factor(1:N)),
+              variable.name="topic",
+              id.vars = "document")  
+
+
+ggplot(data=tp.df, aes(x=topic, y=value, fill=document)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  coord_flip() +
+  facet_wrap(~ document, ncol=2) +
+  theme_bw()
 ```
 
 # Compute similarity between documents
@@ -346,14 +662,32 @@ For exploratory purposes we will embedd the distance matrix onto a 2-dimensional
 
 TODO: init_dims and perplexity has to be tuned for t-SNE. It is yet unclear how to do this properly
 ```{r}
+worker <- function() {
+  bindToEnv(objNames=c("topic.proportions", "opt_k"))
+  function(perplexity) {
+    tsne::tsne(topic.proportions, k=2, initial_dims=opt_k+1, perplexity=perplexity)
+  }
+}
+
+perplexities <- seq(5, 50, by=5)
+t1 <- Sys.time()
+cluster <- startCluster()
+X_tSNE_projections <- parLapply(cluster, perplexities, worker())
+shutDownCluster(cluster)
+t2 <- Sys.time()
+t2 - t1
+
+X_tSNE_projected <- X_tSNE_projections[[1]]
+
+
 X_MDS_projected <- cmdscale(X_dist, k = 2) ## Multi dimensional scaling
-X_tSNE_projected <- tsne(X_dist, k = 2, initial_dims = 10, perplexity = 40) ## t-SNE projection
-preProc = preProcess(X_dist, method=c("center", "scale", "pca"))
-X_PCA_projected = predict(preProc, X_dist)[,1:2] # PCA projection
+# X_tSNE_projected <- tsne(topic.proportions, k = 2, initial_dims = opt_k+1, perplexity = 40) ## t-SNE projection
+preProc = preProcess(topic.proportions, method=c("center", "scale", "pca"))
+X_PCA_projected = predict(preProc, topic.proportions)[,1:2] # PCA projection
 
 projections <- data.frame(Topic=as.factor(doc.topic), 
                           TopWords=as.factor(doc.topic.words),
-                          Proportion=doc.logLik,
+                          Proportion=doc.maxTopicProportion,
                           Title=papers$Title,
                           EventType=papers$EventType,
                           Abstract=papers$Abstract,
@@ -398,8 +732,8 @@ p
 
 # LDAVis Visualization
 ```{r}
-theta <- t(apply(model$document_sums + alpha, 2, function(x) x/sum(x)))
-phi <- t(apply(t(model$topics) + eta, 2, function(x) x/sum(x)))
+theta <- t(apply(model$document_sums + opt_alpha, 2, function(x) x/sum(x)))
+phi <- t(apply(t(model$topics) + opt_eta, 2, function(x) x/sum(x)))
 
 modelParams <- list(phi = phi,
                       theta = theta,
@@ -414,7 +748,14 @@ json <- createJSON(phi = modelParams$phi,
                    vocab = modelParams$vocab, 
                    term.frequency = modelParams$term.frequency)
 
-serVis(json, open.browser = TRUE)
+serVis(json, out.dir = "vis", open.browser = FALSE)
+```
+
+```{r, echo=FALSE}
+tmp <- URLencode(paste(readLines("vis/index.html"), collapse="\n"))
+
+cat('<iframe src="', tmp ,
+    '" style="border: black; seamless:seamless; width: 800px; height: 200px"></iframe>')
 ```
 
 # References
